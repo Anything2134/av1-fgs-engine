@@ -53,6 +53,8 @@ cargo build --release
 
 ## Command-Line Interface (CLI)
 
+```
+
 Usage: av1-fgs-engine [OPTIONS] --input <INPUT>
 
 Options:
@@ -67,6 +69,8 @@ Options:
       --intensity <FLOAT>            Global grain intensity multiplier [default: 1.0]
   -h, --help                         Print help
   -V, --version                      Print version
+
+```
 
   ## Parameter Reference
 
@@ -107,6 +111,77 @@ Grain Profiling & Temporal Search
 1.15
 σ<1.15
 ), it automatically falls back to the imperceptible 70mm baseline.
+
+--fg-search-full: Scans the entire video scene by scene to track variable grain across different shots (e.g., films intercutting between 35mm and 70mm IMAX). Requires --tune-grain.
+
+--forced-fg-search-full: Designed specifically for clean, grainless sources (e.g., modern digital animation, pristine CGI). Instead of generating a single static block for the entire feature, it dynamically modulates the subtle 70mm grain curve according to the luminance and contrast of each scene while remaining nearly imperceptible.
+
+--lookahead <FRAMES>: Enables a rolling temporal window across adjacent scenes. Computes a moving average of noise variance (
+σ
+σ
+) and autocorrelation (
+ρ
+ρ
+) to smooth out transitions and eliminate single-frame grain spikes. Only valid with --fg-search-full or --forced-fg-search-full.
+
+--scenes <PATH>: Points to an Av1an scenes.csv file. Directly aligns grain parameters with the exact chunk boundaries used during parallel encoding.
+
+--intensity <FLOAT>: Fine-tunes the amplitude of synthesized grain (default: 1.0). Use 0.5–0.8 for extra-subtle results or 1.2–1.5 for higher vintage prominence.
+
+## Practical Examples
+
+1. Clean Anime or CGI (Dynamic, Scene-Adaptive Subtle Grain)
+
+```
+./target/release/av1-fgs-engine \
+    -i script.vpy \
+    -o anime_clean.tbl \
+    --force-type 2d \
+    --forced-fg-search-full \
+    --lookahead 8 \
+    --scenes scenes.csv
+```
+2. Multi-Format Film (e.g., IMAX 70mm & 35mm like Interstellar)
+
+```
+ ./target/release/av1-fgs-engine \
+    -i interstellar.mkv \
+    -o interstellar_grain.tbl \
+    --force-type live_action \
+    --tune-grain \
+    --fg-search-full \
+    --lookahead 12 \
+    --scenes scenes.csv
+```
+
+3. Fast Static Single-Pass (Instant Analysis)
+
+```
+ ./target/release/av1-fgs-engine \
+    -i source.mkv \
+    -o static_subtle.tbl \
+    --force-type 2d
+
+```
+
+## Integration with Encoders 
+
+SVT-AV1
+
+```
+SvtAv1EncApp -i input.y4m --fgs-table 70mm_grain.tbl -b output.ivf --preset 4 --crf 24
+
+```
+
+Av1an
+ ```
+av1an -i script.vpy -e svt-av1 -s escenas.csv -v " --crf 24 --fgs-table 70mm_grain.tbl " -o output.mkv
+
+```
+
+## License
+
+This project is licensed under the GNU General Public License v3.0 (GPL-3.0). See the LICENSE file for details.
 
 
 
