@@ -17,7 +17,7 @@ enum ContentType {
 
 #[derive(Parser, Debug)]
 #[command(name = "av1-fgs-engine")]
-#[command(version = "0.2.0")]
+#[command(version = "1.0.0")]
 #[command(about = "High-performance AV1 Film Grain Synthesis (filmgrn1) generator in Rust")]
 struct Args {
     #[arg(short, long, help = "Path to .vpy script or video container (.mkv, .mp4, .y4m)")]
@@ -41,7 +41,7 @@ struct Args {
     #[arg(long, help = "Temporal rolling lookahead window in frames (Only valid with --fg-search-full or --forced-fg-search-full)")]
     lookahead: Option<usize>,
 
-    #[arg(long, help = "Optional path to Av1an scenes.csv file for exact scene-boundary matching")]
+    #[arg(long, help = "Path to Av1an scenes file (supports JSON or CSV format)")]
     scenes: Option<PathBuf>,
 
     #[arg(long, default_value_t = 1.0, help = "Global grain intensity multiplier")]
@@ -50,6 +50,7 @@ struct Args {
 
 const BIN_CENTERS: [u8; 8] = [16, 48, 80, 112, 144, 176, 208, 240];
 
+#[derive(Clone, Debug)]
 struct SceneSegment {
     start_frame: usize,
     end_frame: usize,
@@ -60,25 +61,32 @@ struct Y4mStream {
     width: usize,
     height: usize,
     current_frame: usize,
+    luma_size: usize,
+    chroma_size: usize,
 }
 
 impl Y4mStream {
     fn from_input(path: &Path) -> Result<Self, String> {
+        if !path.exists() {
+            return Err(format!("File does not exist at path: '{}'.", path.display()));
+        }
+
         let is_vpy = path.extension().and_then(|s| s.to_str()) == Some("vpy");
 
-        let child = if is_vpy {
+        let mut child = if is_vpy {
             Command::new("vspipe")
+                .arg("-c")
+                .arg("y4m")
                 .arg(path)
                 .arg("-")
-                .arg("--y4m")
+                .stdin(Stdio::null())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()
                 .map_err(|e| format!("Failed to spawn vspipe: {e}"))?
         } else {
             Command::new("ffmpeg")
-                .arg("-v")
-                .arg("quiet")
+                .arg("-nostdin")
                 .arg("-i")
                 .arg(path)
                 .arg("-f")
@@ -86,20 +94,34 @@ impl Y4mStream {
                 .arg("-pix_fmt")
                 .arg("yuv420p")
                 .arg("-")
+                .stdin(Stdio::null())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()
                 .map_err(|e| format!("Failed to spawn ffmpeg: {e}"))?
         };
 
-        let stdout: Box<dyn Read + Send> = Box::new(child.stdout.ok_or("Failed to capture stream stdout")?);
+        let stdout: Box<dyn Read + Send> = Box::new(child.stdout.take().ok_or("Failed to capture stdout")?);
         let mut reader = BufReader::with_capacity(1024 * 1024, stdout);
 
         let mut header = String::new();
-        reader.read_line(&mut header).map_err(|e| format!("Failed to read Y4M header: {e}"))?;
+        if let Err(e) = reader.read_line(&mut header) {
+            let mut err_msg = String::new();
+            if let Some(mut stderr) = child.stderr.take() {
+                let _ = stderr.read_to_string(&mut err_msg);
+            }
+            return Err(format!("Error reading Y4M stream: {e}\nDetails:\n{err_msg}"));
+        }
 
         if !header.starts_with("YUV4MPEG2") {
-            return Err("Input stream is not valid Y4M format".to_string());
+            let mut err_msg = String::new();
+            if let Some(mut stderr) = child.stderr.take() {
+                let _ = stderr.read_to_string(&mut err_msg);
+            }
+            return Err(format!(
+                "Invalid Y4M header.\nDetails:\n{}",
+                if err_msg.trim().is_empty() { "Process terminated without output." } else { err_msg.trim() }
+            ));
         }
 
         let mut width = 0;
@@ -114,53 +136,56 @@ impl Y4mStream {
         }
 
         if width == 0 || height == 0 {
-            return Err("Video dimensions missing from Y4M stream".to_string());
+            return Err("Video dimensions not detected in Y4M header".to_string());
         }
+
+        let luma_size = width * height;
+        let chroma_size = (width / 2) * (height / 2) * 2;
 
         Ok(Self {
             reader,
             width,
             height,
             current_frame: 0,
+            luma_size,
+            chroma_size,
         })
     }
 
+    fn read_frame_header(&mut self) -> Result<(), ()> {
+        let mut line = Vec::new();
+        match self.reader.read_until(b'\n', &mut line) {
+            Ok(n) if n > 0 && line.starts_with(b"FRAME") => Ok(()),
+            _ => Err(()),
+        }
+    }
+
     fn read_next_luma(&mut self) -> Option<Vec<u8>> {
-        let mut frame_tag = [0u8; 6];
-        if self.reader.read_exact(&mut frame_tag).is_err() {
+        if self.read_frame_header().is_err() {
             return None;
         }
 
-        let mut discard = Vec::new();
-        let _ = self.reader.read_until(b'\n', &mut discard);
-
-        let luma_size = self.width * self.height;
-        let mut luma = vec![0u8; luma_size];
+        let mut luma = vec![0u8; self.luma_size];
         if self.reader.read_exact(&mut luma).is_err() {
             return None;
         }
 
-        let chroma_size = (self.width / 2) * (self.height / 2) * 2;
-        let mut chroma_buf = vec![0u8; chroma_size];
-        let _ = self.reader.read_exact(&mut chroma_buf);
+        if skip_exact_bytes(&mut self.reader, self.chroma_size).is_err() {
+            return None;
+        }
 
         self.current_frame += 1;
         Some(luma)
     }
 
     fn skip_frames(&mut self, count: usize) -> bool {
-        let frame_size = self.width * self.height + (self.width / 2) * (self.height / 2) * 2;
-        let mut buf = vec![0u8; 6];
+        let frame_data_bytes = self.luma_size + self.chroma_size;
 
         for _ in 0..count {
-            if self.reader.read_exact(&mut buf).is_err() {
+            if self.read_frame_header().is_err() {
                 return false;
             }
-            let mut discard = Vec::new();
-            let _ = self.reader.read_until(b'\n', &mut discard);
-
-            let mut skip_buf = vec![0u8; frame_size];
-            if self.reader.read_exact(&mut skip_buf).is_err() {
+            if skip_exact_bytes(&mut self.reader, frame_data_bytes).is_err() {
                 return false;
             }
             self.current_frame += 1;
@@ -169,8 +194,21 @@ impl Y4mStream {
     }
 }
 
+fn skip_exact_bytes<R: BufRead>(reader: &mut R, mut bytes_to_skip: usize) -> std::io::Result<()> {
+    while bytes_to_skip > 0 {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Unexpected EOF"));
+        }
+        let consume_len = buffer.len().min(bytes_to_skip);
+        reader.consume(consume_len);
+        bytes_to_skip -= consume_len;
+    }
+    Ok(())
+}
+
 // -------------------------------------------------------------------------
-// SPECTRAL NOISE ESTIMATION & AUTOCORRELATION
+// SPECTRAL NOISE ANALYSIS
 // -------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
@@ -372,10 +410,6 @@ fn classify_frame_auto(luma: &[u8], width: usize, height: usize) -> ContentType 
     }
 }
 
-// -------------------------------------------------------------------------
-// SUBTLE & IMPERCEPTIBLE BASELINE PROFILES (70mm EMULATION)
-// -------------------------------------------------------------------------
-
 fn get_subtle_70mm_profile(ctype: ContentType, scene_mean_luma: f32) -> (u8, Vec<(u8, u8)>) {
     let lag = match ctype {
         ContentType::TwoD => 2,
@@ -434,10 +468,6 @@ fn get_subtle_70mm_profile(ctype: ContentType, scene_mean_luma: f32) -> (u8, Vec
     (lag, cleaned_sy)
 }
 
-// -------------------------------------------------------------------------
-// STRICT FILMGRN1 SYNTAX WRITER
-// -------------------------------------------------------------------------
-
 fn write_fgs_entry(
     out: &mut File,
     start_f: usize,
@@ -488,27 +518,75 @@ fn rand_seed(salt: usize) -> usize {
     x ^ (x >> 31)
 }
 
-fn parse_av1an_scenes(path: &Path) -> Result<Vec<SceneSegment>, String> {
-    let f = File::open(path).map_err(|e| format!("Failed to open scenes.csv: {e}"))?;
-    let reader = BufReader::new(f);
-    let mut segments = Vec::new();
+// -------------------------------------------------------------------------
+// SCENE PARSING AND CHRONOLOGICAL FILTERING
+// -------------------------------------------------------------------------
 
-    for line in reader.lines() {
-        let l = line.map_err(|e| e.to_string())?;
-        let parts: Vec<&str> = l.split(',').collect();
-        if parts.len() >= 2 {
-            if let (Ok(s), Ok(e)) = (parts[0].trim().parse::<usize>(), parts[1].trim().parse::<usize>()) {
-                segments.push(SceneSegment {
-                    start_frame: s,
-                    end_frame: e,
-                });
+fn parse_av1an_scenes(path: &Path) -> Result<Vec<SceneSegment>, String> {
+    let content = std::fs::read_to_string(path).map_err(|e| format!("Failed to open scenes file: {e}"))?;
+    let mut raw_segments = Vec::new();
+
+    if content.contains("\"scenes\"") || content.trim_start().starts_with('{') {
+        let mut current_start: Option<usize> = None;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.contains("\"start_frame\"") {
+                if let Some(val_str) = trimmed.split(':').nth(1) {
+                    let clean = val_str.trim().trim_end_matches(',').trim();
+                    current_start = clean.parse::<usize>().ok();
+                }
+            } else if trimmed.contains("\"end_frame\"") {
+                if let Some(val_str) = trimmed.split(':').nth(1) {
+                    let clean = val_str.trim().trim_end_matches(',').trim();
+                    if let (Some(s), Ok(e)) = (current_start, clean.parse::<usize>()) {
+                        raw_segments.push(SceneSegment {
+                            start_frame: s,
+                            end_frame: e,
+                        });
+                        current_start = None;
+                    }
+                }
+            }
+        }
+    } else {
+        for line in content.lines() {
+            let l = line.trim();
+            if l.is_empty() || l.starts_with('#') {
+                continue;
+            }
+            let parts: Vec<&str> = if l.contains(',') {
+                l.split(',').collect()
+            } else {
+                l.split_whitespace().collect()
+            };
+
+            if parts.len() >= 2 {
+                if let (Ok(s), Ok(e)) = (parts[0].trim().parse::<usize>(), parts[1].trim().parse::<usize>()) {
+                    raw_segments.push(SceneSegment {
+                        start_frame: s,
+                        end_frame: e,
+                    });
+                }
             }
         }
     }
-    if segments.is_empty() {
-        return Err("No valid scene segments found in scenes.csv".to_string());
+
+    if raw_segments.is_empty() {
+        return Err("No valid scene cuts found in the provided scenes file".to_string());
     }
-    Ok(segments)
+
+    // Strict monotonic filter: eliminates duplicate loops or appended scene lists
+    let mut cleaned_segments: Vec<SceneSegment> = Vec::new();
+    let mut highest_end = 0;
+
+    for seg in raw_segments {
+        if seg.start_frame >= highest_end && seg.end_frame > seg.start_frame {
+            highest_end = seg.end_frame;
+            cleaned_segments.push(seg);
+        }
+    }
+
+    Ok(cleaned_segments)
 }
 
 // -------------------------------------------------------------------------
@@ -524,7 +602,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.fg_search_full && !args.tune_grain {
-        eprintln!("[-] Error: --fg-search-full requires --tune-grain to calibrate source grain.");
+        eprintln!("[-] Error: --fg-search-full requires --tune-grain.");
         std::process::exit(1);
     }
 
@@ -556,10 +634,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("[*] Active temporal mode: {}", mode_desc);
 
         let segments = if let Some(ref sc_path) = args.scenes {
+            let segs = parse_av1an_scenes(sc_path)?;
             println!("    [+] Loading exact scene cuts from: {}", sc_path.display());
-            parse_av1an_scenes(sc_path)?
+            println!("    [+] Clean chronological scene segments to process: {}", segs.len());
+            segs
         } else {
-            println!("    [!] No scenes.csv provided. Fallback to 120-frame chunk intervals...");
+            println!("    [!] No scenes file provided. Fallback to 120-frame intervals...");
             (0..50000)
                 .step_by(120)
                 .map(|start| SceneSegment {
@@ -615,8 +695,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 if idx % 10 == 0 || idx == segments.len() - 1 {
                     println!(
-                        "    - Segment {} [Frames {}..{}]: Mean Luma = {:.1} | Noise Sigma = {:.2}",
+                        "    - Segment {}/{} [Frames {}..{}]: Mean Luma = {:.1} | Noise Sigma = {:.2}",
                         idx + 1,
+                        segments.len(),
                         seg.start_frame,
                         seg.end_frame,
                         smoothed_profile.mean_luma,
@@ -628,7 +709,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     } else {
-        println!("[*] Generating static global grain table (infinite range)...");
+        println!("[*] Generating static global grain table...");
         let (prof, _) = analyze_frame_luma(&first_frame, stream.width, stream.height, content_type);
 
         if args.tune_grain && prof.avg_sigma >= 1.15 {
