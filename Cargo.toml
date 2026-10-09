@@ -1,7 +1,10 @@
 [package]
 name = "av1-fgs-engine"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+authors = ["Anything2134"]
+description = "High-performance AV1 Film Grain Synthesis generator emulating 70mm celluloid film"
+license = "GPL-3.0"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
