@@ -175,7 +175,7 @@ SvtAv1EncApp -i input.y4m --fgs-table 70mm_grain.tbl -b output.ivf --preset 4 --
 
 Av1an
  ```
-av1an -i script.vpy -e svt-av1 -s escenas.csv -v " --crf 24 --fgs-table 70mm_grain.tbl " -o output.mkv
+av1an -i script.vpy -e svt-av1 -s scenes.csv -v " --crf 24 --fgs-table 70mm_grain.tbl " -o output.mkv
 
 ```
 
