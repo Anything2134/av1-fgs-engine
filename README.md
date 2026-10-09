@@ -51,5 +51,64 @@ cargo build --release
 ```
 ---
 
-## Powered By Gemini 3.8 flash.
+## Command-Line Interface (CLI)
 
+Usage: av1-fgs-engine [OPTIONS] --input <INPUT>
+
+Options:
+  -i, --input <INPUT>                Path to .vpy script or video container (.mkv, .mp4, .y4m)
+  -o, --output <OUTPUT>              Output .tbl file path [default: 70mm_grain.tbl]
+      --force-type <2d|3d|live_action> Force content classification
+      --tune-grain                   Analyze and replicate existing real film grain (1:1 clone)
+      --fg-search-full               Exhaustive scene-by-scene search matching original grain (Requires --tune-grain)
+      --forced-fg-search-full        Dynamic scene-adaptive 70mm grain search for clean/grainless content
+      --lookahead <FRAMES>           Temporal rolling lookahead window in frames
+      --scenes <SCENES>              Optional path to Av1an scenes.csv file
+      --intensity <FLOAT>            Global grain intensity multiplier [default: 1.0]
+  -h, --help                         Print help
+  -V, --version                      Print version
+
+  ## Parameter Reference
+
+  Input & Output
+-i, --input <PATH>: Specifies the video file or VapourSynth script. If a .vpy file is passed, vspipe is spawned automatically; otherwise, ffmpeg pipes uncompressed Y4M frames into memory.
+-o, --output <PATH>: Target destination for the generated filmgrn1 parameter table (defaults to 70mm_grain.tbl).
+
+Content Classification
+--force-type <2d | 3d | live_action>: Overrides the automatic spatial variance classifier.
+2d: Designed for anime and traditional animation. Compresses noise in dark lines to protect line art and prevents buzzing in flat color fields.
+3d: Calibrated for CGI and video game renders. Optimizes midtone dithering to break 8/10-bit banding gradients.
+live_action: Full photochemical sensitometric curve matching Kodak Vision / Super Panavision 70 stocks.
+
+Grain Profiling & Temporal Search
+--tune-grain: Activates deep block-based Fourier variance analysis. Measures local standard deviation (
+σ
+σ
+) across 8 luminance intervals (
+16
+,
+48
+,
+80
+,
+112
+,
+144
+,
+176
+,
+208
+,
+240
+16,48,80,112,144,176,208,240
+). If existing grain is detected, it replicates the source's exact grain structure. If the source is clean (
+σ
+<
+1.15
+σ<1.15
+), it automatically falls back to the imperceptible 70mm baseline.
+
+
+
+
+## Powered By Gemini 3.8 flash.
