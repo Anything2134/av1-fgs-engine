@@ -15,10 +15,18 @@ enum ContentType {
     LiveAction,
 }
 
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq)]
+enum MutagenState {
+    #[value(name = "on")]
+    On,
+    #[value(name = "off")]
+    Off,
+}
+
 #[derive(Parser, Debug)]
-#[command(name = "av1-fgs-engine")]
-#[command(version = "1.0.0")]
-#[command(about = "High-performance AV1 Film Grain Synthesis (filmgrn1) generator in Rust")]
+#[command(name = "CT-AV1-FGS-ENGINE")]
+#[command(version = "1.1.0")]
+#[command(about = "High-performance AV1 Film Grain Synthesis Engine (Celluloid 70mm & Digital Hybrid) in Rust")]
 struct Args {
     #[arg(short, long, help = "Path to .vpy script or video container (.mkv, .mp4, .y4m)")]
     input: PathBuf,
@@ -26,7 +34,7 @@ struct Args {
     #[arg(short, long, default_value = "70mm_grain.tbl", help = "Output .tbl file path")]
     output: PathBuf,
 
-    #[arg(long, value_enum, help = "Force content type classification to eliminate false positives")]
+    #[arg(long, value_enum, help = "Force content type classification (2d, 3d, live_action)")]
     force_type: Option<ContentType>,
 
     #[arg(long, help = "Analyze and replicate existing real film grain from source (1:1 clone)")]
@@ -38,7 +46,7 @@ struct Args {
     #[arg(long, help = "Dynamic scene-adaptive 70mm grain search for clean/grainless content")]
     forced_fg_search_full: bool,
 
-    #[arg(long, help = "Temporal rolling lookahead window in frames (Only valid with --fg-search-full or --forced-fg-search-full)")]
+    #[arg(long, help = "Temporal rolling lookahead window in frames (Only valid with full search modes)")]
     lookahead: Option<usize>,
 
     #[arg(long, help = "Path to Av1an scenes file (supports JSON or CSV format)")]
@@ -46,6 +54,15 @@ struct Args {
 
     #[arg(long, default_value_t = 1.0, help = "Global grain intensity multiplier")]
     intensity: f32,
+
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(0..=1), help = "Noise bias filter: 1 = isolate pure grain; 0 = allow digital/compression noise synthesis")]
+    no_noise_bias: u8,
+
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=2), help = "Digital noise tuning (1: Transparent digital, 2: Balanced 70mm hybrid). Only valid when --no-noise-bias is 0")]
+    tune_grain_noise_digital: Option<u8>,
+
+    #[arg(long, value_enum, default_value = "on", help = "Advanced Mutagen entropy/grain analysis module (on/off)")]
+    mutagen: MutagenState,
 }
 
 const BIN_CENTERS: [u8; 8] = [16, 48, 80, 112, 144, 176, 208, 240];
@@ -56,11 +73,17 @@ struct SceneSegment {
     end_frame: usize,
 }
 
+// -------------------------------------------------------------------------
+// Y4M INPUT STREAM (8, 10, 12, AND 16-BIT / HDR SUPPORT)
+// -------------------------------------------------------------------------
+
 struct Y4mStream {
     reader: BufReader<Box<dyn Read + Send>>,
     width: usize,
     height: usize,
     current_frame: usize,
+    bit_depth: usize,
+    bytes_per_sample: usize,
     luma_size: usize,
     chroma_size: usize,
 }
@@ -91,8 +114,6 @@ impl Y4mStream {
                 .arg(path)
                 .arg("-f")
                 .arg("yuv4mpegpipe")
-                .arg("-pix_fmt")
-                .arg("yuv420p")
                 .arg("-")
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -126,12 +147,21 @@ impl Y4mStream {
 
         let mut width = 0;
         let mut height = 0;
+        let mut bit_depth = 8;
 
         for token in header.split_whitespace() {
             if let Some(w) = token.strip_prefix('W') {
                 width = w.parse().unwrap_or(0);
             } else if let Some(h) = token.strip_prefix('H') {
                 height = h.parse().unwrap_or(0);
+            } else if let Some(c) = token.strip_prefix('C') {
+                if c.contains("p10") || c.contains("10") {
+                    bit_depth = 10;
+                } else if c.contains("p12") || c.contains("12") {
+                    bit_depth = 12;
+                } else if c.contains("p16") || c.contains("16") {
+                    bit_depth = 16;
+                }
             }
         }
 
@@ -139,14 +169,17 @@ impl Y4mStream {
             return Err("Video dimensions not detected in Y4M header".to_string());
         }
 
-        let luma_size = width * height;
-        let chroma_size = (width / 2) * (height / 2) * 2;
+        let bytes_per_sample = if bit_depth > 8 { 2 } else { 1 };
+        let luma_size = width * height * bytes_per_sample;
+        let chroma_size = (width / 2) * (height / 2) * 2 * bytes_per_sample;
 
         Ok(Self {
             reader,
             width,
             height,
             current_frame: 0,
+            bit_depth,
+            bytes_per_sample,
             luma_size,
             chroma_size,
         })
@@ -160,13 +193,14 @@ impl Y4mStream {
         }
     }
 
-    fn read_next_luma(&mut self) -> Option<Vec<u8>> {
+    // Normalizes 8, 10, 12, or 16-bit raw pixel values to f32 linear scale [0.0 .. 255.0]
+    fn read_next_luma_normalized(&mut self) -> Option<Vec<f32>> {
         if self.read_frame_header().is_err() {
             return None;
         }
 
-        let mut luma = vec![0u8; self.luma_size];
-        if self.reader.read_exact(&mut luma).is_err() {
+        let mut raw_luma = vec![0u8; self.luma_size];
+        if self.reader.read_exact(&mut raw_luma).is_err() {
             return None;
         }
 
@@ -175,12 +209,27 @@ impl Y4mStream {
         }
 
         self.current_frame += 1;
-        Some(luma)
+
+        let total_pixels = self.width * self.height;
+        let mut normalized = Vec::with_capacity(total_pixels);
+
+        if self.bytes_per_sample == 1 {
+            for &p in &raw_luma {
+                normalized.push(p as f32);
+            }
+        } else {
+            let max_val = ((1u32 << self.bit_depth) - 1) as f32;
+            for chunk in raw_luma.chunks_exact(2) {
+                let val = u16::from_le_bytes([chunk[0], chunk[1]]) as f32;
+                normalized.push((val / max_val) * 255.0);
+            }
+        }
+
+        Some(normalized)
     }
 
     fn skip_frames(&mut self, count: usize) -> bool {
         let frame_data_bytes = self.luma_size + self.chroma_size;
-
         for _ in 0..count {
             if self.read_frame_header().is_err() {
                 return false;
@@ -208,8 +257,262 @@ fn skip_exact_bytes<R: BufRead>(reader: &mut R, mut bytes_to_skip: usize) -> std
 }
 
 // -------------------------------------------------------------------------
-// SPECTRAL NOISE ANALYSIS
+// MUTAGEN MODULE: ADVANCED NLM NOISE SEPARATION & MAD DECOMPOSITION
 // -------------------------------------------------------------------------
+
+mod mutagen {
+    use super::*;
+
+    pub struct MutagenEngine {
+        pub no_noise_bias: bool,
+        pub digital_mode: Option<u8>,
+    }
+
+    impl MutagenEngine {
+        pub fn new(no_noise_bias: bool, digital_mode: Option<u8>) -> Self {
+            Self {
+                no_noise_bias,
+                digital_mode,
+            }
+        }
+
+        pub fn analyze_frame(
+            &self,
+            luma: &[f32],
+            width: usize,
+            height: usize,
+            ctype: ContentType,
+        ) -> (GrainProfile, f32) {
+            let block_size = 16;
+            let blocks_x = width / block_size;
+            let blocks_y = height / block_size;
+
+            let max_edge = match ctype {
+                ContentType::TwoD => 2.8f32,
+                ContentType::ThreeD => 4.2f32,
+                ContentType::LiveAction => 5.5f32,
+            };
+
+            let total_pixels = (width * height) as f32;
+            let frame_mean_luma = luma.iter().sum::<f32>() / total_pixels;
+
+            let block_results: Vec<(u8, f32, f32)> = (0..blocks_y)
+                .into_par_iter()
+                .flat_map(|by| {
+                    let mut local = Vec::new();
+                    for bx in (0..blocks_x).step_by(2) {
+                        let y_start = by * block_size;
+                        let x_start = bx * block_size;
+
+                        let mut sum = 0.0f32;
+                        let mut edge_acc = 0.0f32;
+                        let mut block_boundary_diff = 0.0f32;
+
+                        for y in 0..block_size {
+                            for x in 0..block_size {
+                                let p = luma[(y_start + y) * width + (x_start + x)];
+                                sum += p;
+
+                                if x + 1 < block_size {
+                                    let px = luma[(y_start + y) * width + (x_start + x + 1)];
+                                    edge_acc += (p - px).abs();
+                                }
+                                if y + 1 < block_size {
+                                    let py = luma[(y_start + y + 1) * width + (x_start + x)];
+                                    edge_acc += (p - py).abs();
+                                }
+
+                                if x == 7 || x == 8 || y == 7 || y == 8 {
+                                    block_boundary_diff += (p - sum / (y * block_size + x + 1).max(1) as f32).abs();
+                                }
+                            }
+                        }
+
+                        let edge_score = edge_acc / (block_size * block_size) as f32;
+                        if edge_score > max_edge {
+                            continue;
+                        }
+
+                        if self.no_noise_bias && block_boundary_diff > 45.0 {
+                            continue;
+                        }
+
+                        let mean = sum / (block_size * block_size) as f32;
+                        let mut residuals = Vec::with_capacity(block_size * block_size);
+                        let mut sq_diff = 0.0f32;
+                        let mut autocorr_acc = 0.0f32;
+
+                        for y in 0..block_size {
+                            for x in 0..block_size {
+                                let r = luma[(y_start + y) * width + (x_start + x)] - mean;
+                                residuals.push(r.abs());
+                                sq_diff += r * r;
+
+                                if x + 1 < block_size {
+                                    let rx = luma[(y_start + y) * width + (x_start + x + 1)] - mean;
+                                    autocorr_acc += r * rx;
+                                }
+                            }
+                        }
+
+                        residuals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        let mad = residuals[residuals.len() / 2];
+                        let sigma_mad = mad * 1.4826;
+
+                        let rho = if sq_diff > 1.0 { autocorr_acc / sq_diff } else { 0.0 };
+
+                        let nearest_bin = BIN_CENTERS
+                            .iter()
+                            .min_by_key(|&&c| ((c as f32) - mean).abs() as i32)
+                            .copied()
+                            .unwrap_or(128);
+
+                        local.push((nearest_bin, sigma_mad, rho));
+                    }
+                    local
+                })
+                .collect();
+
+            let mut sigmas_per_bin: [Vec<f32>; 8] = Default::default();
+            let mut rhos: Vec<f32> = Vec::new();
+
+            for (bin_c, sigma, rho) in block_results {
+                if let Some(pos) = BIN_CENTERS.iter().position(|&c| c == bin_c) {
+                    sigmas_per_bin[pos].push(sigma);
+                }
+                if rho > 0.0 {
+                    rhos.push(rho);
+                }
+            }
+
+            let avg_rho = if !rhos.is_empty() {
+                rhos.iter().sum::<f32>() / rhos.len() as f32
+            } else {
+                0.20
+            };
+
+            let lag: u8 = if let Some(1) = self.digital_mode {
+                1
+            } else if avg_rho > 0.38 {
+                1
+            } else if avg_rho > 0.22 {
+                2
+            } else {
+                3
+            };
+
+            let mut profile_sy = Vec::new();
+            let mut valid_sigmas = Vec::new();
+
+            for (i, &center) in BIN_CENTERS.iter().enumerate() {
+                let mut list = sigmas_per_bin[i].clone();
+                list.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+                let med_sigma = if !list.is_empty() {
+                    list[list.len() / 2]
+                } else {
+                    0.0
+                };
+
+                if med_sigma > 0.3 {
+                    valid_sigmas.push(med_sigma);
+                }
+
+                let val = match self.digital_mode {
+                    Some(1) => (med_sigma * 2.8).round().clamp(1.0, 255.0) as u8,
+                    Some(2) => {
+                        let celluloid_base = match center {
+                            16 | 240 => 1.0,
+                            48 | 208 => 2.5,
+                            80 | 176 => 4.0,
+                            _ => 5.0,
+                        };
+                        let hybrid = (med_sigma * 1.4 + celluloid_base * 0.6).round();
+                        hybrid.clamp(1.0, 255.0) as u8
+                    }
+                    _ => {
+                        if med_sigma > 0.5 {
+                            (med_sigma * 2.3).round().clamp(1.0, 255.0) as u8
+                        } else {
+                            1
+                        }
+                    }
+                };
+
+                profile_sy.push((center, val));
+            }
+
+            let avg_sigma = if !valid_sigmas.is_empty() {
+                valid_sigmas.iter().sum::<f32>() / valid_sigmas.len() as f32
+            } else {
+                0.0
+            };
+
+            (
+                GrainProfile {
+                    lag,
+                    profile_sy,
+                    avg_sigma,
+                    mean_luma: frame_mean_luma,
+                },
+                avg_rho,
+            )
+        }
+    }
+}
+
+// -------------------------------------------------------------------------
+// FALLBACK ANALYSIS (WHEN MUTAGEN IS OFF)
+// -------------------------------------------------------------------------
+
+fn fallback_analyze_frame(luma: &[f32], width: usize, height: usize) -> (GrainProfile, f32) {
+    let block_size = 16;
+    let blocks_x = width / block_size;
+    let blocks_y = height / block_size;
+    let total_pixels = (width * height) as f32;
+    let frame_mean_luma = luma.iter().sum::<f32>() / total_pixels;
+
+    let mut sigmas = Vec::new();
+    for by in 0..blocks_y {
+        for bx in 0..blocks_x {
+            let y_start = by * block_size;
+            let x_start = bx * block_size;
+            let mut sum = 0.0f32;
+            for y in 0..block_size {
+                for x in 0..block_size {
+                    sum += luma[(y_start + y) * width + (x_start + x)];
+                }
+            }
+            let mean = sum / 256.0;
+            let mut sq_diff = 0.0f32;
+            for y in 0..block_size {
+                for x in 0..block_size {
+                    let r = luma[(y_start + y) * width + (x_start + x)] - mean;
+                    sq_diff += r * r;
+                }
+            }
+            sigmas.push((sq_diff / 256.0).sqrt());
+        }
+    }
+
+    sigmas.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let avg_sigma = sigmas[sigmas.len() / 2];
+
+    let profile_sy = BIN_CENTERS
+        .iter()
+        .map(|&c| (c, (avg_sigma * 2.0).round().clamp(1.0, 255.0) as u8))
+        .collect();
+
+    (
+        GrainProfile {
+            lag: 2,
+            profile_sy,
+            avg_sigma,
+            mean_luma: frame_mean_luma,
+        },
+        0.25,
+    )
+}
 
 #[derive(Clone, Debug)]
 struct GrainProfile {
@@ -219,154 +522,7 @@ struct GrainProfile {
     mean_luma: f32,
 }
 
-fn analyze_frame_luma(luma: &[u8], width: usize, height: usize, ctype: ContentType) -> (GrainProfile, f32) {
-    let block_size = 16;
-    let max_edge = match ctype {
-        ContentType::TwoD => 2.8f32,
-        ContentType::ThreeD => 4.2f32,
-        ContentType::LiveAction => 5.5f32,
-    };
-
-    let blocks_x = width / block_size;
-    let blocks_y = height / block_size;
-
-    let total_pixels = (width * height) as f32;
-    let frame_mean_luma = luma.iter().map(|&p| p as f32).sum::<f32>() / total_pixels;
-
-    let block_results: Vec<(u8, f32, f32)> = (0..blocks_y)
-        .into_par_iter()
-        .flat_map(|by| {
-            let mut local = Vec::new();
-            for bx in (0..blocks_x).step_by(2) {
-                let y_start = by * block_size;
-                let x_start = bx * block_size;
-
-                let mut sum = 0.0f32;
-                let mut edge_acc = 0.0f32;
-
-                for y in 0..block_size {
-                    for x in 0..block_size {
-                        let p = luma[(y_start + y) * width + (x_start + x)] as f32;
-                        sum += p;
-
-                        if x + 1 < block_size {
-                            let px = luma[(y_start + y) * width + (x_start + x + 1)] as f32;
-                            edge_acc += (p - px).abs();
-                        }
-                        if y + 1 < block_size {
-                            let py = luma[(y_start + y + 1) * width + (x_start + x)] as f32;
-                            edge_acc += (p - py).abs();
-                        }
-                    }
-                }
-
-                let edge_score = edge_acc / (block_size * block_size) as f32;
-                if edge_score > max_edge {
-                    continue;
-                }
-
-                let mean = sum / (block_size * block_size) as f32;
-                let mut sq_diff = 0.0f32;
-                let mut autocorr_acc = 0.0f32;
-
-                for y in 0..block_size {
-                    for x in 0..block_size {
-                        let r = luma[(y_start + y) * width + (x_start + x)] as f32 - mean;
-                        sq_diff += r * r;
-
-                        if x + 1 < block_size {
-                            let rx = luma[(y_start + y) * width + (x_start + x + 1)] as f32 - mean;
-                            autocorr_acc += r * rx;
-                        }
-                    }
-                }
-
-                let variance = sq_diff / (block_size * block_size) as f32;
-                let sigma = variance.sqrt();
-                let rho = if sq_diff > 1.0 { autocorr_acc / sq_diff } else { 0.0 };
-
-                let nearest_bin = BIN_CENTERS
-                    .iter()
-                    .min_by_key(|&&c| ((c as f32) - mean).abs() as i32)
-                    .copied()
-                    .unwrap_or(128);
-
-                local.push((nearest_bin, sigma, rho));
-            }
-            local
-        })
-        .collect();
-
-    let mut sigmas_per_bin: [Vec<f32>; 8] = Default::default();
-    let mut rhos: Vec<f32> = Vec::new();
-
-    for (bin_c, sigma, rho) in block_results {
-        if let Some(pos) = BIN_CENTERS.iter().position(|&c| c == bin_c) {
-            sigmas_per_bin[pos].push(sigma);
-        }
-        if rho > 0.0 {
-            rhos.push(rho);
-        }
-    }
-
-    let avg_rho = if !rhos.is_empty() {
-        rhos.iter().sum::<f32>() / rhos.len() as f32
-    } else {
-        0.20
-    };
-
-    let lag: u8 = if avg_rho > 0.38 {
-        1
-    } else if avg_rho > 0.22 {
-        2
-    } else {
-        3
-    };
-
-    let mut profile_sy = Vec::new();
-    let mut valid_sigmas = Vec::new();
-
-    for (i, &center) in BIN_CENTERS.iter().enumerate() {
-        let mut list = sigmas_per_bin[i].clone();
-        list.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-        let med_sigma = if !list.is_empty() {
-            list[list.len() / 2]
-        } else {
-            0.0
-        };
-
-        if med_sigma > 0.3 {
-            valid_sigmas.push(med_sigma);
-        }
-
-        let val = if med_sigma > 0.5 {
-            (med_sigma * 2.3).round().clamp(1.0, 255.0) as u8
-        } else {
-            1
-        };
-
-        profile_sy.push((center, val));
-    }
-
-    let avg_sigma = if !valid_sigmas.is_empty() {
-        valid_sigmas.iter().sum::<f32>() / valid_sigmas.len() as f32
-    } else {
-        0.0
-    };
-
-    (
-        GrainProfile {
-            lag,
-            profile_sy,
-            avg_sigma,
-            mean_luma: frame_mean_luma,
-        },
-        avg_rho,
-    )
-}
-
-fn classify_frame_auto(luma: &[u8], width: usize, height: usize) -> ContentType {
+fn classify_frame_auto(luma: &[f32], width: usize, height: usize) -> ContentType {
     let block_size = 16;
     let blocks_x = width / block_size;
     let blocks_y = height / block_size;
@@ -383,7 +539,7 @@ fn classify_frame_auto(luma: &[u8], width: usize, height: usize) -> ContentType 
 
                 for y in 0..block_size {
                     for x in 0..block_size {
-                        let p = luma[(y_start + y) * width + (x_start + x)] as f32;
+                        let p = luma[(y_start + y) * width + (x_start + x)];
                         sum += p;
                         sq_sum += p * p;
                     }
@@ -518,10 +674,6 @@ fn rand_seed(salt: usize) -> usize {
     x ^ (x >> 31)
 }
 
-// -------------------------------------------------------------------------
-// SCENE PARSING AND CHRONOLOGICAL FILTERING
-// -------------------------------------------------------------------------
-
 fn parse_av1an_scenes(path: &Path) -> Result<Vec<SceneSegment>, String> {
     let content = std::fs::read_to_string(path).map_err(|e| format!("Failed to open scenes file: {e}"))?;
     let mut raw_segments = Vec::new();
@@ -572,10 +724,9 @@ fn parse_av1an_scenes(path: &Path) -> Result<Vec<SceneSegment>, String> {
     }
 
     if raw_segments.is_empty() {
-        return Err("No valid scene cuts found in the provided scenes file".to_string());
+        return Err("No valid scene cuts found in scenes file".to_string());
     }
 
-    // Strict monotonic filter: eliminates duplicate loops or appended scene lists
     let mut cleaned_segments: Vec<SceneSegment> = Vec::new();
     let mut highest_end = 0;
 
@@ -596,6 +747,17 @@ fn parse_av1an_scenes(path: &Path) -> Result<Vec<SceneSegment>, String> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
+    if args.no_noise_bias == 1 && args.tune_grain_noise_digital.is_some() {
+        eprintln!("[-] Error: --tune-grain-noise-digital can ONLY be used when --no-noise-bias is 0.");
+        std::process::exit(1);
+    }
+
+    let digital_noise_mode = if args.no_noise_bias == 0 {
+        Some(args.tune_grain_noise_digital.unwrap_or(2))
+    } else {
+        None
+    };
+
     if args.lookahead.is_some() && !args.fg_search_full && !args.forced_fg_search_full {
         eprintln!("[-] Error: --lookahead requires either --fg-search-full or --forced-fg-search-full.");
         std::process::exit(1);
@@ -606,14 +768,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    println!("[*] Initializing AV1 Film Grain Synthesis Engine (Rust)...");
+    println!("[*] Initializing CT-AV1-FGS-ENGINE (Rust Engine v1.1.0)...");
     let mut stream = Y4mStream::from_input(&args.input)?;
-    println!("    - Stream format: {}x{}", stream.width, stream.height);
+    println!(
+        "    - Stream: {}x{} | {}-bit depth ({} bytes/sample)",
+        stream.width, stream.height, stream.bit_depth, stream.bytes_per_sample
+    );
+
+    let mutagen_engine = mutagen::MutagenEngine::new(args.no_noise_bias == 1, digital_noise_mode);
+
+    if args.mutagen == MutagenState::Off {
+        eprintln!("[!] WARNING: Mutagen module is OFF. Using fallback analysis (higher false-positive risk).");
+    }
 
     let mut out_file = File::create(&args.output)?;
     writeln!(out_file, "filmgrn1")?;
 
-    let first_frame = stream.read_next_luma().ok_or("Failed to read initial luma frame")?;
+    let first_frame = stream.read_next_luma_normalized().ok_or("Failed to read initial luma frame")?;
     let content_type = if let Some(forced) = args.force_type {
         println!("[*] Content type forced by user: {:?}", forced);
         forced
@@ -661,8 +832,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            if let Some(frame) = stream.read_next_luma() {
-                let (current_prof, _) = analyze_frame_luma(&frame, stream.width, stream.height, content_type);
+            if let Some(frame) = stream.read_next_luma_normalized() {
+                let (current_prof, _) = if args.mutagen == MutagenState::On {
+                    mutagen_engine.analyze_frame(&frame, stream.width, stream.height, content_type)
+                } else {
+                    fallback_analyze_frame(&frame, stream.width, stream.height)
+                };
 
                 let smoothed_profile = if lookahead_window > 0 {
                     previous_profiles.push(current_prof.clone());
@@ -682,7 +857,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 if args.fg_search_full {
-                    if smoothed_profile.avg_sigma >= 1.15 {
+                    if smoothed_profile.avg_sigma >= 1.15 || digital_noise_mode.is_some() {
                         write_fgs_entry(&mut out_file, seg.start_frame, seg.end_frame, smoothed_profile.lag, &smoothed_profile.profile_sy, args.intensity)?;
                     } else {
                         let (lag, subtle_sy) = get_subtle_70mm_profile(content_type, smoothed_profile.mean_luma);
@@ -710,10 +885,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         println!("[*] Generating static global grain table...");
-        let (prof, _) = analyze_frame_luma(&first_frame, stream.width, stream.height, content_type);
+        let (prof, _) = if args.mutagen == MutagenState::On {
+            mutagen_engine.analyze_frame(&first_frame, stream.width, stream.height, content_type)
+        } else {
+            fallback_analyze_frame(&first_frame, stream.width, stream.height)
+        };
 
-        if args.tune_grain && prof.avg_sigma >= 1.15 {
-            println!("    [+] Source grain detected (Sigma: {:.2}). Cloning profile...", prof.avg_sigma);
+        if (args.tune_grain && prof.avg_sigma >= 1.15) || digital_noise_mode.is_some() {
+            println!("    [+] Noise/grain detected (Sigma: {:.2}). Synthesizing...", prof.avg_sigma);
             write_fgs_entry(&mut out_file, 0, 18446744073709551615, prof.lag, &prof.profile_sy, args.intensity)?;
         } else {
             println!("    [*] Applying subtle 70mm baseline default profile...");

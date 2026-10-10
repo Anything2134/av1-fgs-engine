@@ -1,9 +1,9 @@
 [package]
-name = "av1-fgs-engine"
-version = "0.2.0"
+name = "ct-av1-fgs-engine"
+version = "1.1.0"
 edition = "2021"
 authors = ["Anything2134"]
-description = "High-performance AV1 Film Grain Synthesis generator emulating 70mm celluloid film"
+description = "CT-AV1-FGS-ENGINE: Advanced Hybrid Celluloid & Digital Noise AV1 Film Grain Synthesis Engine"
 license = "GPL-3.0"
 
 [dependencies]
