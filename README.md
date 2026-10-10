@@ -22,8 +22,8 @@ However, existing approaches often encounter practical challenges:
 2. **Encoder-side estimators** (`--film-grain` / `--denoise-noise-level`) introduce significant CPU overhead during pre-analysis and frequently lift deep shadow blacks.
 3. **Static generic grain tables** remain invariant throughout an entire feature, failing to adapt when film stocks change (e.g., transitions between 35mm and IMAX 70mm) or when lighting shifts between high-key daylight and low-key night scenes.
 
-<<<<<<< HEAD
-`CT-AV1-FGS-ENGINE` was created to solve these limitations. It models the microscopic, high-density physical structure of **large-format 70mm celluloid film**, delivering clean, organic grain that is virtually imperceptible to the human eye while providing natural dithering against 8/10-bit color banding.
+
+ ### `CT-AV1-FGS-ENGINE` was created to solve these limitations. It models the microscopic, high-density physical structure of **large-format 70mm celluloid film**, delivering clean, organic grain that is virtually imperceptible to the human eye while providing natural dithering against 8/10-bit color banding.
 =======
 **CT-AV1-FGS-ENGINE** seeks to bridge this gap. Operating as a fast, external pre-pass in Rust, it analyzes video streams, separates real grain from digital compression artifacts, and writes temporally accurate `filmgrn1` parameter tables without penalizing encoder throughput.
 >>>>>>> 0286232 (docs: update README with CT-AV1-FGS-ENGINE specifications, Mutagen module, and compilation guide)
@@ -90,15 +90,6 @@ cargo build --release
 ```
 ---
 
-
-## License
-
-This project is licensed under the GNU General Public License v3.0 (GPL-3.0). See the LICENSE file for details.
-
-
-
-
-## Powered By Gemini 3.8 flash.
 =======
 # Install globally in ~/.cargo/bin
 cargo install --path .
@@ -190,3 +181,13 @@ av1an -i input.vpy -e svt-av1 -s scenes.json -v " --crf 24 --fgs-table 70mm_grai
 
 ```
 >>>>>>> 0286232 (docs: update README with CT-AV1-FGS-ENGINE specifications, Mutagen module, and compilation guide)
+
+```
+## License
+
+This project is licensed under the GNU General Public License v3.0 (GPL-3.0). See the LICENSE file for details.
+
+
+
+
+## Powered By Gemini 3.8 flash.
