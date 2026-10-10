@@ -25,7 +25,7 @@ enum MutagenState {
 
 #[derive(Parser, Debug)]
 #[command(name = "CT-AV1-FGS-ENGINE")]
-#[command(version = "1.1.0")]
+#[command(version = "1.1.1")]
 #[command(about = "High-performance AV1 Film Grain Synthesis Engine (Celluloid 70mm & Digital Hybrid) in Rust")]
 struct Args {
     #[arg(short, long, help = "Path to .vpy script or video container (.mkv, .mp4, .y4m)")]
@@ -74,7 +74,7 @@ struct SceneSegment {
 }
 
 // -------------------------------------------------------------------------
-// Y4M INPUT STREAM (8, 10, 12, AND 16-BIT / HDR SUPPORT)
+// STREAM DE ENTRADA Y4M (SOPORTE 8, 10, 12 Y 16 BITS / HDR / BT.2020)
 // -------------------------------------------------------------------------
 
 struct Y4mStream {
@@ -112,6 +112,10 @@ impl Y4mStream {
                 .arg("-nostdin")
                 .arg("-i")
                 .arg(path)
+                .arg("-map")
+                .arg("0:v:0")
+                .arg("-strict")
+                .arg("-1") // Permite formatos Y4M de alta profundidad (10/12/16-bit)
                 .arg("-f")
                 .arg("yuv4mpegpipe")
                 .arg("-")
@@ -193,7 +197,6 @@ impl Y4mStream {
         }
     }
 
-    // Normalizes 8, 10, 12, or 16-bit raw pixel values to f32 linear scale [0.0 .. 255.0]
     fn read_next_luma_normalized(&mut self) -> Option<Vec<f32>> {
         if self.read_frame_header().is_err() {
             return None;
@@ -257,7 +260,7 @@ fn skip_exact_bytes<R: BufRead>(reader: &mut R, mut bytes_to_skip: usize) -> std
 }
 
 // -------------------------------------------------------------------------
-// MUTAGEN MODULE: ADVANCED NLM NOISE SEPARATION & MAD DECOMPOSITION
+// MÓDULO MUTAGEN: ESTIMACIÓN AVANZADA DE RUIDO Y DESCOMPOSICIÓN MAD
 // -------------------------------------------------------------------------
 
 mod mutagen {
@@ -462,7 +465,7 @@ mod mutagen {
 }
 
 // -------------------------------------------------------------------------
-// FALLBACK ANALYSIS (WHEN MUTAGEN IS OFF)
+// ANÁLISIS DE RESPALDO (MUTAGEN OFF)
 // -------------------------------------------------------------------------
 
 fn fallback_analyze_frame(luma: &[f32], width: usize, height: usize) -> (GrainProfile, f32) {
@@ -741,7 +744,7 @@ fn parse_av1an_scenes(path: &Path) -> Result<Vec<SceneSegment>, String> {
 }
 
 // -------------------------------------------------------------------------
-// ENTRYPOINT
+// ENTRYPOINT PRINCIPAL
 // -------------------------------------------------------------------------
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -768,7 +771,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    println!("[*] Initializing CT-AV1-FGS-ENGINE (Rust Engine v1.1.0)...");
+    println!("[*] Initializing CT-AV1-FGS-ENGINE (Rust Engine v1.1.1)...");
     let mut stream = Y4mStream::from_input(&args.input)?;
     println!(
         "    - Stream: {}x{} | {}-bit depth ({} bytes/sample)",
